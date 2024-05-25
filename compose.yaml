@@ -1,28 +1,41 @@
 services:
   redis-master:
-    image: redis
+    image: redis:7.2.5-bookworm
+    hostname: redis-master
     container_name: redis-master
     ports:
       - "6379:6379"
-
-  sentinel:
-    image: redis
-    container_name: sentinel
-    command: ["redis-server", "--port", "26379", "--sentinel"]
-    ports:
-      - "26379:26379"
-    depends_on:
-      - redis-master
+    environment:
+      - REDIS_REPLICATION_MODE=master
 
   redis-slave:
-    image: redis
+    image: redis:7.2.5-bookworm
     container_name: redis-slave
     command: ["redis-server", "--slaveof", "redis-master", "6379"]
     depends_on:
       - redis-master
+    environment:
+      - REDIS_REPLICATION_MODE=slave
+      - REDIS_MASTER_HOST=redis-master
+      - REDIS_MASTER_PORT=6379
+
+  sentinel:
+    image: redis:7.2.5-bookworm
+    container_name: sentinel
+    command: ["redis-server", "/usr/local/etc/redis/sentinel.conf", "--sentinel"]
+    ports:
+      - "26379:26379"
+    depends_on:
+      - redis-master
+    volumes:
+      - ./sentinel.conf:/usr/local/etc/redis/sentinel.conf
+    environment:
+      - REDIS_MASTER_HOST=redis-master
+      - REDIS_MASTER_PORT=6379
+      - REDIS_MASTER_NAME=mymaster
 
   prometheus:
-    image: prom/prometheus
+    image: prom/prometheus:v2.52.0
     container_name: prometheus
     ports:
       - "9090:9090"
@@ -47,3 +60,4 @@ services:
       - REDIS_MASTER_NAME=mymaster
     depends_on:
       - sentinel
+
