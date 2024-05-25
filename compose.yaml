@@ -1,0 +1,49 @@
+services:
+  redis-master:
+    image: redis
+    container_name: redis-master
+    ports:
+      - "6379:6379"
+
+  sentinel:
+    image: redis
+    container_name: sentinel
+    command: ["redis-server", "--port", "26379", "--sentinel"]
+    ports:
+      - "26379:26379"
+    depends_on:
+      - redis-master
+
+  redis-slave:
+    image: redis
+    container_name: redis-slave
+    command: ["redis-server", "--slaveof", "redis-master", "6379"]
+    depends_on:
+      - redis-master
+
+  prometheus:
+    image: prom/prometheus
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+    depends_on:
+      - sentinel
+
+  sentinel-exporter:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: dev
+    container_name: sentinel-exporter
+    ports:
+      - "9478:9478"
+    environment:
+      - REDIS_SENTINEL_HOST=sentinel
+      - REDIS_SENTINEL_PORT=26379
+      - REDIS_MASTER_NAME=mymaster
+    depends_on:
+      - sentinel

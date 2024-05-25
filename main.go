@@ -1,116 +1,74 @@
 package main
 
 import (
-	"flag"
+	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"strconv"
 	"time"
 
-	"github.com/go-redis/redis/v8"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"golang.org/x/net/context"
+	"github.com/redis/go-redis/v9"
 )
 
 var (
-	redisAddr             string
-	redisPassword         string
-	scrapeInterval        int
-	metricsPort           int
-	debug                 bool
-	masterInfoGauge       *prometheus.GaugeVec
-	sentinelsCurrentGauge *prometheus.GaugeVec
+	redisConnections = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "myapp_redis_connections",
+		Help: "The number of connections to Redis",
+	})
 )
 
-func init() {
-	flag.StringVar(&redisAddr, "addr", "localhost:26379", "Redis Sentinel address")
-	flag.StringVar(&redisPassword, "password", "", "Redis password")
-	flag.IntVar(&scrapeInterval, "interval", 30, "Scrape interval in seconds")
-	flag.IntVar(&metricsPort, "metrics-port", 9478, "Metrics port")
-	flag.BoolVar(&debug, "debug", false, "Enable debug logging")
-	flag.Parse()
+func getMetrics(rdb *redis.Client) {
+	val := rdb.PoolStats().TotalConns
+	redisConnections.Set(float64(val))
+}
 
-	if debug {
-		log.SetFlags(log.Lshortfile | log.LstdFlags)
-	}
-
-	masterInfoGauge = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "sentinel_master_info",
-			Help: "Basic master information",
-		},
-		[]string{"master_name", "master_ip"},
-	)
-
-	sentinelsCurrentGauge = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "sentinel_sentinels_current",
-			Help: "Number of running sentinels",
-		},
-		[]string{"master_name", "state"},
-	)
-
-	prometheus.MustRegister(masterInfoGauge)
-	prometheus.MustRegister(sentinelsCurrentGauge)
+func recordMetrics(rdb *redis.Client) {
+	go func() {
+		for {
+			redisConnections.Inc()
+			getMetrics(rdb)
+			time.Sleep(2 * time.Second)
+		}
+	}()
 }
 
 func main() {
-	go func() {
-		for {
-			collectMetrics()
-			time.Sleep(time.Duration(scrapeInterval) * time.Second)
-		}
-	}()
-
-	http.Handle("/metrics", promhttp.Handler())
-	log.Printf("Starting server on :%d", metricsPort)
-	log.Fatal(http.ListenAndServe(":9478", nil))
-}
-
-func collectMetrics() {
-	ctx := context.Background()
-	client := redis.NewClient(&redis.Options{
-		Addr:     redisAddr,
-		Password: redisPassword,
-	})
-
-	masters, err := client.SentinelMasters(ctx).Result()
-	if err != nil {
-		log.Printf("Error fetching sentinel masters: %v", err)
-		return
+	redisSentinelHost := os.Getenv("REDIS_SENTINEL_HOST")
+	if redisSentinelHost == "" {
+		log.Fatal("REDIS_SENTINEL_HOST is not set")
 	}
 
-	for _, master := range masters {
-		masterName := master["name"]
-		masterIP := master["ip"]
+	redisSentinelPortStr := os.Getenv("REDIS_SENTINEL_PORT")
+	if redisSentinelPortStr == "" {
+		log.Fatal("REDIS_SENTINEL_PORT is not set")
+	}
 
-		masterInfoGauge.With(prometheus.Labels{
-			"master_name": masterName,
-			"master_ip":   masterIP,
-		}).Set(1)
+	redisSentinelPort, err := strconv.Atoi(redisSentinelPortStr)
+	if err != nil {
+		log.Fatalf("Invalid REDIS_SENTINEL_PORT: %s", err)
+	}
 
-		sentinels, err := client.SentinelSentinels(ctx, masterName).Result()
-		if err != nil {
-			log.Printf("Error fetching sentinels for master %s: %v", masterName, err)
-			continue
-		}
+	redisMasterName := os.Getenv("REDIS_MASTER_NAME")
+	if redisMasterName == "" {
+		log.Fatal("REDIS_MASTER_NAME is not set")
+	}
 
-		up, down := 0, 0
-		for _, sentinel := range sentinels {
-			if sentinel["is_disconnected"] == "0" {
-				up++
-			} else {
-				down++
-			}
-		}
+	rdb := redis.NewFailoverClient(&redis.FailoverOptions{
+		SentinelAddrs: []string{fmt.Sprintf("%s:%d", redisSentinelHost, redisSentinelPort)},
+		MasterName:    redisMasterName,
+		DialTimeout:   5 * time.Second,
+		ReadTimeout:   5 * time.Second,
+		WriteTimeout:  5 * time.Second,
+	})
 
-		sentinelsCurrentGauge.With(prometheus.Labels{
-			"master_name": masterName,
-			"state":       "up",
-		}).Set(float64(up))
-		sentinelsCurrentGauge.With(prometheus.Labels{
-			"master_name": masterName,
-			"state":       "down",
-		}).Set(float64(down))
+	recordMetrics(rdb)
+
+	http.Handle("/metrics", promhttp.Handler())
+	if err := http.ListenAndServe(":9478", nil); err != nil {
+		log.Fatal("Failed to start exporter:", err)
 	}
 }
